@@ -2,8 +2,15 @@
 
 import asyncio
 import logging
+import os
+import sys
 from datetime import timedelta
 import json
+
+# Prepend local councils directory so overrides take priority over the pip package
+_LOCAL_COUNCILS = os.path.join(os.path.dirname(__file__), "councils")
+if _LOCAL_COUNCILS not in sys.path:
+    sys.path.insert(0, _LOCAL_COUNCILS)
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
