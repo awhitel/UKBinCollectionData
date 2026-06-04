@@ -1,3 +1,5 @@
+import re
+
 import requests
 from bs4 import BeautifulSoup
 from dateutil.parser import parse
@@ -11,6 +13,22 @@ from uk_bin_collection.uk_bin_collection.common import (
     timedelta,
 )
 from uk_bin_collection.uk_bin_collection.get_bin_data import AbstractGetBinDataClass
+
+
+def _address_range_contains(address: str, house_number: int) -> bool:
+    """Return True if house_number falls within an "X TO Y / A TO B" range in address."""
+    m = re.search(r"\((\d+) TO (END|\d+)\s*/\s*(\d+) TO (END|\d+)", address)
+    if not m:
+        return False
+    r1s = int(m.group(1))
+    r1e = float("inf") if m.group(2) == "END" else int(m.group(2))
+    r2s = int(m.group(3))
+    r2e = float("inf") if m.group(4) == "END" else int(m.group(4))
+    if house_number % 2 == r1s % 2 and r1s <= house_number <= r1e:
+        return True
+    if house_number % 2 == r2s % 2 and r2s <= house_number <= r2e:
+        return True
+    return False
 
 
 class CouncilClass(AbstractGetBinDataClass):
@@ -31,6 +49,7 @@ class CouncilClass(AbstractGetBinDataClass):
         location_x: int = 0
         location_y: int = 0
         location_usrn: str = ""
+        house_number: int = 0
 
         # Ensure any cookies set are maintained in a requests session
         s = requests.session()
@@ -107,6 +126,12 @@ class CouncilClass(AbstractGetBinDataClass):
                 )
                 location_x = location_list[0].get("X")
                 location_y = location_list[0].get("Y")
+                pao = [
+                    detail.get("Value")
+                    for detail in location_detail
+                    if detail.get("Name") == "PAO_START_NUMBER"
+                ]
+                house_number = int(pao[0]) if pao and pao[0] else 0
                 break
 
         # Needed to initialise the server to allow follow on call
@@ -161,20 +186,27 @@ class CouncilClass(AbstractGetBinDataClass):
             raise KeyError("Tables wasn't present in ResultSet")
         result = result_tables[0]
         column_names: dict[int, str] = {}
-        result_dict: dict[str, str | int] = {}
         for column in result.get("ColumnDefinitions"):
             column_names[column.get("ColumnIndex")] = column.get("ColumnName")
+        result_dict: dict[str, str | int] = {}
+        first_usrn_match: dict[str, str | int] | None = None
         for r in result.get("Records"):
-            result_dict: dict[str, str | int] = {}
+            candidate: dict[str, str | int] = {}
             for idx, column_value in enumerate(r):
                 if not (column_name := column_names.get(idx)):
                     raise IndexError("Column index out of range")
-                result_dict[column_name.upper()] = column_value
-            # Validate the street against the USRN. Some locations can return multiple results.
-            # Break on first match of USRN
-            # TODO: Need to select the correct option out of all available options
-            if location_usrn == str(result_dict.get("USRN")):
+                candidate[column_name.upper()] = column_value
+            if location_usrn != str(candidate.get("USRN")):
+                continue
+            if first_usrn_match is None:
+                first_usrn_match = candidate
+            if house_number and _address_range_contains(
+                str(candidate.get("ADDRESS", "")), house_number
+            ):
+                result_dict = candidate
                 break
+        else:
+            result_dict = first_usrn_match or result_dict
 
         refuse_week, recycling_week, garden_week = 0, 0, 0
         # After we've got the correct result, pull out the week number each bin type is taken on
@@ -200,18 +232,31 @@ class CouncilClass(AbstractGetBinDataClass):
             "SUN",
         ]
 
-        refuse_day_offset = days_of_week.index(
-            str(result_dict.get("New_Refuse_Day_internal".upper())).upper()
+        # ROUNDDESC (e.g. "WK1 FRI N5") records the current refuse round and is more
+        # reliable than the individual day fields, which can be left stale after a
+        # round change.  When all four day fields agree but contradict ROUNDDESC, use
+        # the ROUNDDESC day for all bin types (in Cheltenham all types share one day).
+        refuse_raw = str(result_dict.get("New_Refuse_Day_internal".upper())).upper()
+        recycling_raw = str(result_dict.get("New_Recycling_Day".upper())).upper()
+        garden_raw = str(result_dict.get("New_Garden_Day".upper())).upper()
+        food_raw = str(result_dict.get("New_Food_Day".upper())).upper()
+
+        rounddesc_parts = str(result_dict.get("ROUNDDESC", "")).upper().split()
+        rounddesc_day = (
+            rounddesc_parts[1]
+            if len(rounddesc_parts) >= 2 and rounddesc_parts[1] in days_of_week
+            else None
         )
-        recycling_day_offset = days_of_week.index(
-            str(result_dict.get("New_Recycling_Day".upper())).upper()
-        )
-        garden_day_offset = days_of_week.index(
-            str(result_dict.get("New_Garden_Day".upper())).upper()
-        )
-        food_day_offset = days_of_week.index(
-            str(result_dict.get("New_Food_Day".upper())).upper()
-        )
+        all_days_equal = refuse_raw == recycling_raw == garden_raw == food_raw
+        if rounddesc_day and rounddesc_day != refuse_raw and all_days_equal:
+            resolved_day = rounddesc_day
+        else:
+            resolved_day = None
+
+        refuse_day_offset = days_of_week.index(resolved_day or refuse_raw)
+        recycling_day_offset = days_of_week.index(resolved_day or recycling_raw)
+        garden_day_offset = days_of_week.index(resolved_day or garden_raw)
+        food_day_offset = days_of_week.index(resolved_day or food_raw)
 
         # Initialise WEEK-1/WEEK-2 based on known details
         week_1_epoch = datetime(2025, 1, 13)
